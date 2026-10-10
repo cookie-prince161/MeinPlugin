@@ -1,0 +1,21 @@
+name: OreAlert
+version: 1.0.0
+main: com.elias.orealert.OreAlert
+api-version: '26.1'
+description: Warnt Admins, wenn ein Spieler auffaellig viele Erze in kurzer Zeit abbaut.
+
+commands:
+  oreinspect:
+    description: Teleportiert dich im Spectator-Modus zu einem Spieler
+    usage: /oreinspect <Spieler>
+    permission: orealert.use
+  return:
+    description: Bringt dich zurueck an deinen alten Ort und Spielmodus
+    usage: /return
+    permission: orealert.use
+
+permissions:
+  orealert.use:
+    default: op
+  orealert.notify:
+    default: op
