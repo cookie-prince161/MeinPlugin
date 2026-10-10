@@ -30,33 +30,40 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
 
     // ===== EINSTELLUNGEN: hier kannst du die Zahlen ändern =====
 
-    // Ein Zeitfenster: Name, Länge in Millisekunden, Alarm bei MEHR als dieser Anzahl
-    private record Window(String label, long ms, int threshold) {}
+    // Regel 1: Erze, die an natürlicher Luft/Höhle/Wasser liegen (sichtbar)
+    // Alarm bei MEHR als VISIBLE_THRESHOLD Erzen innerhalb von VISIBLE_WINDOW_MS
+    private static final long VISIBLE_WINDOW_MS = 60_000L;
+    private static final int VISIBLE_THRESHOLD = 30;
 
-    private static final Window[] WINDOWS = {
-            new Window("1 Minute", 60_000L, 10),
-            new Window("10 Minuten", 600_000L, 25),
-            new Window("1 Stunde", 3_600_000L, 60)
+    // Regel 2: Versteckte Erze (Luft daneben nur vom Spieler selbst gegraben)
+    // Alarm, wenn mindestens minOres versteckte Erze abgebaut wurden UND
+    // diese mindestens minShare (0.10 = 10 %) aller abgebauten Blöcke im Zeitfenster ausmachen
+    private record Ratio(String label, long ms, int minOres, double minShare) {}
+
+    private static final Ratio[] RATIOS = {
+            new Ratio("10 Minuten", 600_000L, 6, 0.10),
+            new Ratio("1 Stunde", 3_600_000L, 15, 0.05)
     };
 
-    // Regel für versteckte Erze (Zeitfenster 10 Minuten):
-    // Alarm, wenn mindestens HIDDEN_MIN_COUNT versteckte Erze abgebaut wurden
-    // UND mindestens HIDDEN_MIN_SHARE (0.75 = 75 %) aller Erze der Gruppe versteckt waren
-    private static final long HIDDEN_WINDOW_MS = 600_000L;
-    private static final int HIDDEN_MIN_COUNT = 8;
-    private static final double HIDDEN_MIN_SHARE = 0.75;
+    // So lange gilt ein vom Spieler gegrabener Block als "selbst gegraben"
+    private static final long DUG_MEMORY_MS = 600_000L;
 
-    // Längstes Zeitfenster, so lange werden Abbau-Zeitpunkte gemerkt
+    // So lange werden Abbau-Zeitpunkte insgesamt gemerkt
     private static final long KEEP_MS = 3_600_000L;
+    private static final int MAX_HITS = 50_000;
 
     // ===== Ab hier nichts ändern, außer du weißt, was du tust =====
 
-    private record Hit(long time, boolean hidden) {}
+    // Ein abgebauter Block: Zeit, Erzgruppe (null = kein überwachtes Erz), natürlich frei?
+    private record Hit(long time, String group, boolean exposed) {}
 
-    // Wer hat wann welche Erzgruppe abgebaut
-    private final Map<UUID, Map<String, Deque<Hit>>> tracker = new HashMap<>();
-    // Wann zuletzt Alarm ausgelöst wurde (Schlüssel: Spieler + Gruppe + Regel)
-    private final Map<String, Long> lastAlert = new HashMap<>();
+    private static final class PlayerData {
+        final Deque<Hit> hits = new ArrayDeque<>();
+        final Map<Long, Long> dug = new HashMap<>();
+        final Map<String, Long> lastAlert = new HashMap<>();
+    }
+
+    private final Map<UUID, PlayerData> data = new HashMap<>();
     // Gespeicherter Ort und Spielmodus der Admins für /return
     private final Map<UUID, Location> returnLocations = new HashMap<>();
     private final Map<UUID, GameMode> returnModes = new HashMap<>();
@@ -83,8 +90,16 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
         return null;
     }
 
-    // Ein Erz gilt als versteckt, wenn es auf allen sechs Seiten von festen Blöcken umgeben ist
-    private boolean isHidden(Block block) {
+    // Eindeutiger Zahlenschlüssel für die Position eines Blocks
+    private static long key(Block block) {
+        return ((long) (block.getX() & 0x3FFFFFF) << 38)
+                | ((long) (block.getZ() & 0x3FFFFFF) << 12)
+                | (long) (block.getY() & 0xFFF);
+    }
+
+    // true = das Erz grenzt an natürliche Luft/Höhle/Wasser (also sichtbar)
+    // false = das Erz war ringsum fest, oder die Luft daneben hat der Spieler selbst gegraben
+    private boolean isNaturallyExposed(Block block, PlayerData pd, long now) {
         BlockFace[] faces = {
                 BlockFace.UP, BlockFace.DOWN,
                 BlockFace.NORTH, BlockFace.SOUTH,
@@ -93,10 +108,13 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
         for (BlockFace face : faces) {
             Block neighbor = block.getRelative(face);
             if (neighbor.isLiquid() || !neighbor.getType().isSolid()) {
-                return false;
+                Long dugTime = pd.dug.get(key(neighbor));
+                if (dugTime == null || now - dugTime > DUG_MEMORY_MS) {
+                    return true;
+                }
             }
         }
-        return true;
+        return false;
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -108,78 +126,78 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         Block block = event.getBlock();
+        long now = System.currentTimeMillis();
+        PlayerData pd = data.computeIfAbsent(player.getUniqueId(), k -> new PlayerData());
+
         String group = groupOf(block.getType());
-        if (group == null) {
+        // Wichtig: erst prüfen, danach den Block als "gegraben" merken
+        boolean exposed = group != null && isNaturallyExposed(block, pd, now);
+
+        pd.hits.addLast(new Hit(now, group, exposed));
+        pd.dug.put(key(block), now);
+
+        while (!pd.hits.isEmpty()
+                && (now - pd.hits.peekFirst().time() > KEEP_MS || pd.hits.size() > MAX_HITS)) {
+            pd.hits.pollFirst();
+        }
+        if (pd.dug.size() > 20_000) {
+            pd.dug.values().removeIf(t -> now - t > DUG_MEMORY_MS);
+        }
+
+        if (group != null) {
+            checkRules(player, pd, group, now);
+        }
+    }
+
+    private void checkRules(Player player, PlayerData pd, String group, long now) {
+        // Regel 1: viele sichtbare Erze in kurzer Zeit
+        String visibleKey = group + ":visible";
+        long visibleSince = Math.max(now - VISIBLE_WINDOW_MS, pd.lastAlert.getOrDefault(visibleKey, 0L));
+        int visibleCount = 0;
+        long firstVisible = now;
+        for (Hit hit : pd.hits) {
+            if (hit.time() > visibleSince && group.equals(hit.group()) && hit.exposed()) {
+                visibleCount++;
+                if (hit.time() < firstVisible) {
+                    firstVisible = hit.time();
+                }
+            }
+        }
+        if (visibleCount > VISIBLE_THRESHOLD) {
+            pd.lastAlert.put(visibleKey, now);
+            alertAdmins(player, player.getName() + ": " + visibleCount + "x " + group
+                    + " an natürlichen Höhlen/Luft in " + duration(now - firstVisible) + " ");
             return;
         }
 
-        long now = System.currentTimeMillis();
-        Deque<Hit> hits = tracker
-                .computeIfAbsent(player.getUniqueId(), k -> new HashMap<>())
-                .computeIfAbsent(group, k -> new ArrayDeque<>());
+        // Regel 2: auffällig viele versteckte Erze im Verhältnis zu allen abgebauten Blöcken
+        for (Ratio ratio : RATIOS) {
+            String ratioKey = group + ":" + ratio.label();
+            long since = Math.max(now - ratio.ms(), pd.lastAlert.getOrDefault(ratioKey, 0L));
 
-        hits.addLast(new Hit(now, isHidden(block)));
-        while (!hits.isEmpty() && now - hits.peekFirst().time() > KEEP_MS) {
-            hits.pollFirst();
-        }
-
-        checkRules(player, group, hits, now);
-    }
-
-    private void checkRules(Player player, String group, Deque<Hit> hits, long now) {
-        UUID id = player.getUniqueId();
-
-        // Regel 1: Anzahl pro Zeitfenster
-        for (Window window : WINDOWS) {
-            String key = id + ":" + group + ":" + window.label();
-            long since = Math.max(now - window.ms(), lastAlert.getOrDefault(key, 0L));
-
-            int count = 0;
-            int hiddenCount = 0;
+            int total = 0;
+            int hidden = 0;
             long first = now;
-            for (Hit hit : hits) {
+            for (Hit hit : pd.hits) {
                 if (hit.time() > since) {
-                    count++;
-                    if (hit.hidden()) {
-                        hiddenCount++;
-                    }
-                    if (hit.time() < first) {
-                        first = hit.time();
+                    total++;
+                    if (group.equals(hit.group()) && !hit.exposed()) {
+                        hidden++;
+                        if (hit.time() < first) {
+                            first = hit.time();
+                        }
                     }
                 }
             }
 
-            if (count > window.threshold()) {
-                lastAlert.put(key, now);
-                alertAdmins(player, group, count, hiddenCount, now - first,
-                        "Zeitfenster " + window.label());
+            if (hidden >= ratio.minOres() && (double) hidden / total >= ratio.minShare()) {
+                long percent = Math.round(100.0 * hidden / total);
+                pd.lastAlert.put(ratioKey, now);
+                alertAdmins(player, player.getName() + ": " + hidden + "x " + group
+                        + " versteckt abgebaut (" + percent + " % aller Blöcke, "
+                        + duration(now - first) + ") ");
                 return;
             }
-        }
-
-        // Regel 2: auffällig viele versteckte Erze
-        String hiddenKey = id + ":" + group + ":hidden";
-        long since = Math.max(now - HIDDEN_WINDOW_MS, lastAlert.getOrDefault(hiddenKey, 0L));
-
-        int count = 0;
-        int hiddenCount = 0;
-        long first = now;
-        for (Hit hit : hits) {
-            if (hit.time() > since) {
-                count++;
-                if (hit.hidden()) {
-                    hiddenCount++;
-                }
-                if (hit.time() < first) {
-                    first = hit.time();
-                }
-            }
-        }
-
-        if (hiddenCount >= HIDDEN_MIN_COUNT && (double) hiddenCount / count >= HIDDEN_MIN_SHARE) {
-            lastAlert.put(hiddenKey, now);
-            alertAdmins(player, group, count, hiddenCount, now - first,
-                    "viele versteckte Erze");
         }
     }
 
@@ -191,13 +209,8 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
         return (seconds / 60) + " Minuten";
     }
 
-    private void alertAdmins(Player miner, String group, int count, int hiddenCount,
-                             long spanMs, String reason) {
-        String text = "[OreAlert] " + miner.getName() + ": " + count + "x " + group
-                + ", davon " + hiddenCount + " versteckt, in " + duration(spanMs)
-                + " (" + reason + ") ";
-
-        TextComponent message = new TextComponent(text);
+    private void alertAdmins(Player miner, String text) {
+        TextComponent message = new TextComponent("[OreAlert] " + text);
         message.setColor(ChatColor.RED);
 
         TextComponent button = new TextComponent("[Hinteleportieren]");
@@ -211,7 +224,7 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
                 admin.spigot().sendMessage(message);
             }
         }
-        getLogger().info(text);
+        getLogger().info("[OreAlert] " + text);
     }
 
     @Override
@@ -265,8 +278,6 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
-        UUID id = event.getPlayer().getUniqueId();
-        tracker.remove(id);
-        lastAlert.keySet().removeIf(key -> key.startsWith(id.toString()));
+        data.remove(event.getPlayer().getUniqueId());
     }
 }
