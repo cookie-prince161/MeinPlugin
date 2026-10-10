@@ -49,7 +49,7 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
     };
 
     // Mindestabstand zwischen zwei Meldungen über denselben Spieler
-    private static final long ALERT_COOLDOWN_MS = 30_000L;
+    private static final long ALERT_COOLDOWN_MS = 0L;
 
     // So lange gilt ein vom Spieler gegrabener Block als "selbst gegraben"
     private static final long DUG_MEMORY_MS = 600_000L;
