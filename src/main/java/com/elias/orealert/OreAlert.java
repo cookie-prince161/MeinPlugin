@@ -7,6 +7,8 @@ import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -26,13 +28,35 @@ import java.util.UUID;
 
 public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
 
-    // Zeitfenster in Millisekunden (60 Sekunden)
-    private static final long WINDOW_MS = 60_000L;
-    // Alarm, wenn MEHR als diese Anzahl im Zeitfenster abgebaut wurde
-    private static final int THRESHOLD = 10;
+    // ===== EINSTELLUNGEN: hier kannst du die Zahlen ändern =====
+
+    // Ein Zeitfenster: Name, Länge in Millisekunden, Alarm bei MEHR als dieser Anzahl
+    private record Window(String label, long ms, int threshold) {}
+
+    private static final Window[] WINDOWS = {
+            new Window("1 Minute", 60_000L, 10),
+            new Window("10 Minuten", 600_000L, 25),
+            new Window("1 Stunde", 3_600_000L, 60)
+    };
+
+    // Regel für versteckte Erze (Zeitfenster 10 Minuten):
+    // Alarm, wenn mindestens HIDDEN_MIN_COUNT versteckte Erze abgebaut wurden
+    // UND mindestens HIDDEN_MIN_SHARE (0.75 = 75 %) aller Erze der Gruppe versteckt waren
+    private static final long HIDDEN_WINDOW_MS = 600_000L;
+    private static final int HIDDEN_MIN_COUNT = 8;
+    private static final double HIDDEN_MIN_SHARE = 0.75;
+
+    // Längstes Zeitfenster, so lange werden Abbau-Zeitpunkte gemerkt
+    private static final long KEEP_MS = 3_600_000L;
+
+    // ===== Ab hier nichts ändern, außer du weißt, was du tust =====
+
+    private record Hit(long time, boolean hidden) {}
 
     // Wer hat wann welche Erzgruppe abgebaut
-    private final Map<UUID, Map<String, Deque<Long>>> tracker = new HashMap<>();
+    private final Map<UUID, Map<String, Deque<Hit>>> tracker = new HashMap<>();
+    // Wann zuletzt Alarm ausgelöst wurde (Schlüssel: Spieler + Gruppe + Regel)
+    private final Map<String, Long> lastAlert = new HashMap<>();
     // Gespeicherter Ort und Spielmodus der Admins für /return
     private final Map<UUID, Location> returnLocations = new HashMap<>();
     private final Map<UUID, GameMode> returnModes = new HashMap<>();
@@ -59,6 +83,22 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
         return null;
     }
 
+    // Ein Erz gilt als versteckt, wenn es auf allen sechs Seiten von festen Blöcken umgeben ist
+    private boolean isHidden(Block block) {
+        BlockFace[] faces = {
+                BlockFace.UP, BlockFace.DOWN,
+                BlockFace.NORTH, BlockFace.SOUTH,
+                BlockFace.EAST, BlockFace.WEST
+        };
+        for (BlockFace face : faces) {
+            Block neighbor = block.getRelative(face);
+            if (neighbor.isLiquid() || !neighbor.getType().isSolid()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBlockBreak(BlockBreakEvent event) {
         Player player = event.getPlayer();
@@ -67,31 +107,95 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
             return;
         }
 
-        String group = groupOf(event.getBlock().getType());
+        Block block = event.getBlock();
+        String group = groupOf(block.getType());
         if (group == null) {
             return;
         }
 
         long now = System.currentTimeMillis();
-        Deque<Long> times = tracker
+        Deque<Hit> hits = tracker
                 .computeIfAbsent(player.getUniqueId(), k -> new HashMap<>())
                 .computeIfAbsent(group, k -> new ArrayDeque<>());
 
-        times.addLast(now);
-        while (!times.isEmpty() && now - times.peekFirst() > WINDOW_MS) {
-            times.pollFirst();
+        hits.addLast(new Hit(now, isHidden(block)));
+        while (!hits.isEmpty() && now - hits.peekFirst().time() > KEEP_MS) {
+            hits.pollFirst();
         }
 
-        if (times.size() > THRESHOLD) {
-            int count = times.size();
-            times.clear(); // danach muss erst wieder neu gesammelt werden, kein Spam
-            alertAdmins(player, group, count);
+        checkRules(player, group, hits, now);
+    }
+
+    private void checkRules(Player player, String group, Deque<Hit> hits, long now) {
+        UUID id = player.getUniqueId();
+
+        // Regel 1: Anzahl pro Zeitfenster
+        for (Window window : WINDOWS) {
+            String key = id + ":" + group + ":" + window.label();
+            long since = Math.max(now - window.ms(), lastAlert.getOrDefault(key, 0L));
+
+            int count = 0;
+            int hiddenCount = 0;
+            long first = now;
+            for (Hit hit : hits) {
+                if (hit.time() > since) {
+                    count++;
+                    if (hit.hidden()) {
+                        hiddenCount++;
+                    }
+                    if (hit.time() < first) {
+                        first = hit.time();
+                    }
+                }
+            }
+
+            if (count > window.threshold()) {
+                lastAlert.put(key, now);
+                alertAdmins(player, group, count, hiddenCount, now - first,
+                        "Zeitfenster " + window.label());
+                return;
+            }
+        }
+
+        // Regel 2: auffällig viele versteckte Erze
+        String hiddenKey = id + ":" + group + ":hidden";
+        long since = Math.max(now - HIDDEN_WINDOW_MS, lastAlert.getOrDefault(hiddenKey, 0L));
+
+        int count = 0;
+        int hiddenCount = 0;
+        long first = now;
+        for (Hit hit : hits) {
+            if (hit.time() > since) {
+                count++;
+                if (hit.hidden()) {
+                    hiddenCount++;
+                }
+                if (hit.time() < first) {
+                    first = hit.time();
+                }
+            }
+        }
+
+        if (hiddenCount >= HIDDEN_MIN_COUNT && (double) hiddenCount / count >= HIDDEN_MIN_SHARE) {
+            lastAlert.put(hiddenKey, now);
+            alertAdmins(player, group, count, hiddenCount, now - first,
+                    "viele versteckte Erze");
         }
     }
 
-    private void alertAdmins(Player miner, String group, int count) {
-        String text = "[OreAlert] " + miner.getName() + " hat " + count + "x " + group
-                + " in unter einer Minute abgebaut. ";
+    private String duration(long ms) {
+        long seconds = Math.max(1, ms / 1000);
+        if (seconds < 120) {
+            return seconds + " Sekunden";
+        }
+        return (seconds / 60) + " Minuten";
+    }
+
+    private void alertAdmins(Player miner, String group, int count, int hiddenCount,
+                             long spanMs, String reason) {
+        String text = "[OreAlert] " + miner.getName() + ": " + count + "x " + group
+                + ", davon " + hiddenCount + " versteckt, in " + duration(spanMs)
+                + " (" + reason + ") ";
 
         TextComponent message = new TextComponent(text);
         message.setColor(ChatColor.RED);
@@ -161,6 +265,8 @@ public class OreAlert extends JavaPlugin implements Listener, CommandExecutor {
 
     @EventHandler
     public void onQuit(PlayerQuitEvent event) {
-        tracker.remove(event.getPlayer().getUniqueId());
+        UUID id = event.getPlayer().getUniqueId();
+        tracker.remove(id);
+        lastAlert.keySet().removeIf(key -> key.startsWith(id.toString()));
     }
 }
